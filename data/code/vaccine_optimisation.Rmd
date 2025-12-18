@@ -1,0 +1,871 @@
+---
+title: Vaccine Optimisation
+output: html_document
+date: "2025-11-30"
+---
+```{r}
+# 1. Libraries & solver helper -------------------------------------------------
+# These lines load the optimisation, data-manipulation, and plotting libraries needed to build, solve, and analyse the Phase 1 vaccine allocation model. We also define a small helper function solve_glpk() to solve any ompr model using the GLPK solver via the ROI interface. 
+
+library(ompr)            # modelling: variables, objective, constraints
+library(ompr.roi)        # bridge: ompr -> ROI
+library(ROI)             # solver interface
+library(ROI.plugin.glpk) # GLPK LP/MIP solver
+library(dplyr)           # tidy summaries/diagnostics
+library(tibble)          # tidy tables
+library(purrr)           # list/map helpers
+library(tidyr)
+solve_glpk <- function(m) ompr::solve_model(m, ompr.roi::with_ROI(solver = "glpk"))
+```
+
+```{r}
+# 2. Sets & parameters (single-period) -----------------------------------------
+# This section defines all sets and core parameters required for the Phase 1 allocation model, including vaccines, regions, age groups, supply, boxing capacity, and health-benefit weights. It also constructs population caps and minimum frontline coverage by region–age cell, ensuring the optimisation reflects operational constraints and clinical prioritisation rules.
+
+vaccines   <- c("Pfizer/BioNTech","AstraZeneca")
+regions    <- c("NORTH EAST","NORTH WEST","YORKSHIRE AND THE HUMBER","EAST MIDLANDS",
+                "WEST MIDLANDS","EAST","LONDON","SOUTH EAST","SOUTH WEST")
+age_groups <- c("80+","70-79","60-69","50-59","30-49","<30")
+
+# One-off national supply (t = 1 only)
+S_total <- c("Pfizer/BioNTech" = 4e6,
+             "AstraZeneca"     = 10e6)
+
+# Boxing units per dose (Pfizer/BioNTech uses 2 units/dose; AZ uses 1)
+u <- c("Pfizer/BioNTech" = 2,
+       "AstraZeneca"     = 1)
+
+# Regional boxing capacity (week-1 only; binding logistics cap)
+K_r <- c("NORTH EAST"=150000,"NORTH WEST"=2210237,"YORKSHIRE AND THE HUMBER"=1657905,
+         "EAST MIDLANDS"=1459675,"WEST MIDLANDS"=1788579,"EAST"=1880748,
+         "LONDON"=2700746,"SOUTH EAST"=2765180,"SOUTH WEST"=1697743)
+K_r <- K_r[regions] # ensure order matches 'regions'
+
+# Population caps by region × age
+P_ra <- matrix(byrow = TRUE, nrow = length(regions), ncol = length(age_groups),
+               data = c(
+                 141046,247406,321867,374722,644385,951337,
+                 365581,644544,805580,1012335,1843054,2696362,
+                 278810,481845,604754,748490,1362920,2049531,
+                 248075,449080,545037,679642,1191124,1752625,
+                 304678,515243,620733,792926,1486019,2242330,
+                 349870,579443,684405,867001,1602799,2185643,
+                 303460,476851,723718,1078660,2878016,3541783,
+                 513283,836494,994575,1286973,2334470,3251470,
+                 350796,593214,680444,796384,1335016,1903289),
+               dimnames = list(regions = regions, ages = age_groups))
+
+# Mortality-weighted benefit by vaccine × age
+b_va <- rbind(
+  "Pfizer/BioNTech" = c("80+"=10,"70-79"=9,"60-69"=7,"50-59"=5,"30-49"=3,"<30"=1),
+  "AstraZeneca"     = c("80+"=10,"70-79"=6,"60-69"=2,"50-59"=1,"30-49"=0,"<30"=0)
+)
+
+# Frontline minima (share of age-population)
+FL_share_a <- c("80+"=0,"70-79"=0,"60-69"=0.01,"50-59"=0.02,"30-49"=0.03,"<30"=0)
+FL_min_ra  <- sweep(P_ra, 2, FL_share_a[colnames(P_ra)], `*`)
+```
+
+```{r}
+# 3. Index helpers -------------------------------------------------------------
+# This section creates index sets for vaccines, regions, and age groups, enabling clean and efficient formulation of constraints within the optimisation model. It also defines helper mappings for benefit weights and identifies policy-relevant subsets—specifically, AstraZeneca and the under-50 age groups—to support age-restricted vaccine allocation rules. 
+
+V <- seq_along(vaccines); 
+R <- seq_along(regions); 
+A <- seq_along(age_groups)
+
+b_va_ <- function(v, a) b_va[vaccines[v], age_groups[a]]
+
+# indices for the new policy
+v_az      <- which(vaccines == "AstraZeneca")
+A_under50 <- which(age_groups %in% c("30-49", "<30"))
+```
+
+```{r}
+# 4. Model build (allocation-only LP) ------------------------------------------
+# This block constructs the linear optimisation model by defining the decision variable x[v,r,a], setting the health-benefit–maximising objective, and adding all Phase 1 constraints. These include supply limits, population caps, frontline-worker minima, regional boxing capacity, and a rule preventing AstraZeneca from being allocated to under-50 age groups as there is no health-benefit gain from AZ for these age groups. 
+
+model <- MIPModel() %>%
+  
+  # Decision variable: doses allocated of vaccine v to region r and age group a
+  add_variable(x[v, r, a], v = V, r = R, a = A, type = "continuous", lb = 0) %>%
+  
+  # Objective: maximise mortality/transmission-weighted benefit
+  set_objective(
+    sum_expr(b_va_(v, a) * x[v, r, a], v = V, r = R, a = A), "max"
+  ) %>%
+  
+  # Supply constraint: cannot exceed national stock by vaccine
+  add_constraint(
+    sum_expr(x[v, r, a], r = R, a = A) <= S_total[vaccines[v]],
+    v = V
+  ) %>%
+  
+  # Population constraint: cannot vaccinate more than regional age-population
+  add_constraint(
+    sum_expr(x[v, r, a], v = V) <= P_ra[r, a, drop = TRUE],
+    r = R, a = A
+  ) %>%
+  
+  # Frontline worker constraint: minimum number of frontline doses
+  add_constraint(
+    sum_expr(x[v, r, a], v = V) >= FL_min_ra[r, a, drop = TRUE],
+    r = R, a = A
+  ) %>%
+  
+  # Boxing capacity constraint: storage/transport limit per region
+  add_constraint(
+    sum_expr(u[vaccines[v]] * x[v, r, a], v = V, a = A) <= K_r[regions[r]],
+    r = R
+  ) %>%
+  
+  # Policy rule: AZ cannot be given to under-50s
+  add_constraint(
+    x[v, r, a] == 0,
+    v = v_az, r = R, a = A_under50
+  )
+```
+
+
+
+```{r}
+# 5. Solve & extract -----------------------------------------------------------
+# Measure runtime
+t_glpk <- system.time({
+  result <- solve_glpk(model)
+})
+
+# Print raw solver outputs
+cat("[5] Solver status:", result$status, "\n")
+cat("[5] Objective (benefit units):", objective_value(result), "\n")
+cat("[5] Solver runtime (seconds):", t_glpk["elapsed"], "\n\n")
+
+# Written sentence requested
+cat(sprintf(
+  "The optimisation model solved successfully with status '%s', ",
+  result$status
+))
+cat(sprintf(
+  "achieved an objective value of %.2f benefit units, ",
+  objective_value(result)
+))
+cat(sprintf(
+  "and completed in %.4f seconds using the GLPK solver.\n",
+  t_glpk["elapsed"]
+))
+
+# Extract solution for decision variables
+sol_x <- get_solution(result, x[v, r, a]) %>%
+  mutate(
+    v_name = vaccines[v],
+    r_name = regions[r],
+    a_name = age_groups[a]
+  ) %>%
+  select(v_name, r_name, a_name, value)
+
+# Helper tables reused later
+eps <- 1e-6
+admin_tbl <- sol_x %>%
+  group_by(r_name, a_name) %>%
+  summarise(admin = sum(value), .groups = "drop")
+
+needs_tbl <- as.data.frame(as.table(FL_min_ra))
+names(needs_tbl) <- c("r_name", "a_name", "need")
+
+```
+
+```{r}
+# 6. Diagnostics ---------------------------------------------------------------
+# This diagnostics section evaluates how the optimal solution performs against key operational and policy constraints by checking supply utilisation, boxing capacity saturation, frontline coverage, site requirements, and age–region vaccination rates. It also produces detailed allocation tables and vaccine-mix summaries, ensuring the recommended rollout is interpretable, feasible, and fully defendable for stakeholder review.
+
+# 6.1 Supply utilisation & unallocated doses
+supply_use <- sol_x %>%
+  group_by(v_name) %>% summarise(allocated = sum(value), .groups = "drop") %>%
+  rowwise() %>% mutate(supply = S_total[v_name],
+                       unallocated = pmax(0, supply - allocated),
+                       util_pct = allocated / supply) %>% ungroup()
+cat("\n[6.1] Supply utilisation & unallocated doses:\n"); print(supply_use)
+
+# Open table in RStudio viewer
+View(supply_use)
+
+# 6.2 Regional boxing usage (bind/slack)
+box_use <- sol_x %>%
+  mutate(units = u[v_name] * value) %>%
+  group_by(r_name) %>% summarise(units = sum(units), .groups = "drop") %>%
+  rowwise() %>% mutate(cap = K_r[r_name],
+                       slack = cap - units,
+                       pct = ifelse(cap > 0, units / cap, NA_real_)) %>% ungroup() %>%
+  arrange(desc(pct))
+cat("\n[6.2] Boxing usage by region (pct = 1.0 → binding):\n"); print(box_use)
+
+# Open table in RStudio viewer
+View(box_use)
+
+# 6.3 Frontline minima: pass/fail by region × age
+fl_check <- needs_tbl %>% left_join(admin_tbl, by = c("r_name", "a_name")) %>%
+  mutate(admin = ifelse(is.na(admin), 0, admin),
+         gap = pmax(0, need - admin),
+         pass = gap <= eps) %>% arrange(desc(gap))
+cat("\n[6.3] Frontline minima gaps (if any):\n"); print(fl_check %>% filter(!pass) %>% head(20))
+
+# 6.4 One-vaccine-per-site → minimum sites implied (per region)
+sites_min_r <- sol_x %>%
+  group_by(r_name, v_name) %>% summarise(alloc = sum(value), .groups = "drop_last") %>%
+  summarise(min_sites = sum(alloc > eps), .groups = "drop") %>% arrange(desc(min_sites))
+cat("\n[6.4] Minimum sites per region (vaccine-exclusive):\n"); print(sites_min_r)
+
+# Open table in RStudio viewer
+View(sites_min_r)
+
+# 6.5 Allocation table (rounded preview)
+alloc_tbl <- sol_x %>% arrange(r_name, a_name, desc(v_name)) %>% mutate(value = round(value, 2))
+cat("\n[6.6] Allocation table preview (rounded):\n"); print(alloc_tbl %>% head(25))
+
+# Open table in RStudio viewer
+View(alloc_tbl)
+
+# 6.6 Regional doses by vaccine
+region_vaccine_doses <- sol_x %>%
+  group_by(r_name, v_name) %>%
+  summarise(doses = sum(value), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = v_name, values_from = doses, values_fill = 0) %>%
+  mutate(total_region = rowSums(across(where(is.numeric))))
+cat("\n[6.7] Doses to send per region by vaccine:\n"); print(region_vaccine_doses)
+
+# Open table in RStudio viewer
+View(region_vaccine_doses)
+
+# 6.7 Coverage proportion by region × age (overall coverage)
+pop_lookup <- function(r, a) P_ra[match(r, regions), match(a, age_groups)]
+coverage_ra <- sol_x %>%
+  group_by(r_name, a_name) %>%
+  summarise(admin = sum(value), .groups = "drop") %>%
+  mutate(pop = mapply(pop_lookup, r_name, a_name),
+         coverage_pct = ifelse(pop > 0, 100 * admin / pop, NA_real_))
+cat("\n[6.8] Coverage by region × age (percent of age group vaccinated):\n")
+print(coverage_ra %>% arrange(r_name, factor(a_name, levels = age_groups)))
+
+# Open table in RStudio viewer
+View(coverage_ra %>% arrange(r_name, factor(a_name, levels = age_groups)))
+
+# 6.8 Vaccine mix within region × age (share of admin & population)
+vaccine_mix_ra <- sol_x %>%
+  group_by(r_name, a_name, v_name) %>%
+  summarise(admin = sum(value), .groups = "drop") %>%
+  mutate(pop = mapply(pop_lookup, r_name, a_name)) %>%
+  group_by(r_name, a_name) %>%
+  mutate(admin_total = sum(admin),
+         share_of_admin = ifelse(admin_total > 0, admin / admin_total, NA_real_),
+         share_of_population = ifelse(pop > 0, admin / pop, NA_real_)) %>%
+  ungroup()
+cat("\n[6.9] Vaccine mix by region × age (share of admin and share of population):\n")
+print(vaccine_mix_ra %>% arrange(r_name, factor(a_name, levels = age_groups), desc(v_name)))
+
+# Open table in RStudio viewer
+View(vaccine_mix_ra %>% arrange(r_name, factor(a_name, levels = age_groups), desc(v_name)))
+
+# 6.9 Coverage by vaccine, region × age (wide table)
+coverage_by_vaccine_wide <- vaccine_mix_ra %>%
+  select(r_name, a_name, v_name, share_of_population) %>%
+  tidyr::pivot_wider(names_from = v_name,
+                     values_from = share_of_population,
+                     values_fill = 0) %>%
+  mutate(across(-c(r_name, a_name), ~ 100 * .x)) %>%
+  arrange(r_name, factor(a_name, levels = age_groups))
+cat("\n[6.10] Population coverage (%) by vaccine, region × age:\n")
+print(coverage_by_vaccine_wide)
+
+# Open table in RStudio viewer
+View(coverage_by_vaccine_wide)
+```
+
+```{r}
+# 7. Finite-difference marginal value by region (boxing capacity) --------------
+# This section quantifies the marginal benefit of increasing boxing capacity in each region by re-optimising the model with a small capacity increment (of 1000) and computing the resulting change in the objective value. These finite-difference estimates help identify where additional storage or transport capacity would most improve health outcomes, providing evidence-based guidance for Phase 2 investment decisions.
+
+delta <- 1000L  # extra boxing units per tested region (tune as needed)
+Z_base <- objective_value(result)
+
+# Helper: rebuild model with a provided capacity vector K_vec
+build_model_with_K <- function(K_vec) {
+  MIPModel() %>%
+    add_variable(x[v, r, a], v = V, r = R, a = A, type = "continuous", lb = 0) %>%
+    set_objective(
+      sum_expr(b_va_(v, a) * x[v, r, a], v = V, r = R, a = A),
+      "max"
+    ) %>%
+    add_constraint(
+      sum_expr(x[v, r, a], r = R, a = A) <= S_total[vaccines[v]],
+      v = V
+    ) %>%
+    add_constraint(
+      sum_expr(x[v, r, a], v = V) <= P_ra[r, a, drop = TRUE],
+      r = R, a = A
+    ) %>%
+    add_constraint(
+      sum_expr(x[v, r, a], v = V) >= FL_min_ra[r, a, drop = TRUE],
+      r = R, a = A
+    ) %>%
+    add_constraint(
+      sum_expr(u[vaccines[v]] * x[v, r, a], v = V, a = A) <= K_vec[regions[r]],
+      r = R
+    ) %>%
+    add_constraint(
+      x[v, r, a] == 0,
+      v = v_az,
+      r = R,
+      a = A_under50
+    )
+}
+
+# Re-optimise once per region with a +delta bump to its boxing capacity
+fd_mv <- purrr::map_dfr(regions, function(rr) {
+  K_bumped <- K_r
+  K_bumped[rr] <- K_bumped[rr] + delta
+  res_b <- solve_glpk(build_model_with_K(K_bumped))
+  tibble::tibble(
+    r_name   = rr,
+    status   = res_b$status,
+    Z_new    = objective_value(res_b),
+    fd_value = (Z_new - Z_base) / delta  # ≈ marginal benefit per boxing unit
+  )
+})
+
+# Join diagnostics, flag binding, and present
+fd_mv <- fd_mv %>%
+  dplyr::left_join(box_use, by = "r_name") %>%  # from §6.2
+  dplyr::mutate(binding = is.finite(pct) & abs(pct - 1) <= 1e-6) %>%
+  dplyr::select(r_name, cap, units, slack, pct, binding, fd_value, status) %>%
+  dplyr::arrange(dplyr::desc(fd_value))
+
+cat("\n[7] Finite-difference marginal value per region",
+    " (Δ objective per +", delta, " boxing units; reported per boxing unit):\n", sep = "")
+print(fd_mv)
+View(fd_mv)
+
+hot <- fd_mv %>% dplyr::filter(fd_value > 1e-9) %>% dplyr::pull(r_name)
+if (length(hot) == 0) {
+  cat("\n[7] Interpretation: No region shows positive marginal value at +", delta,
+      " units — extra boxing capacity does not raise the objective.\n", sep = "")
+} else {
+  cat("\n[7] Interpretation: Extra boxing capacity is most valuable in:\n  - ",
+      paste(hot, collapse = ", "), "\n", sep = "")
+}
+
+# The finite-difference marginal value (fd_value in the table) quantifies how much additional health benefit is unlocked by expanding boxing capacity in each region. A value of 10 for the North East indicates that each additional unit of capacity there generates ten units of national benefit—five to ten times higher than other regions—making it the clear priority for Phase 2 logistics investment.
+```
+
+```{r}
+# 8. How to best allocate the remaining doses of AstraZeneca? -----------------
+# This section identifies where any remaining AstraZeneca doses should be directed by ranking regions and age groups according to clinical benefit and unmet need, focusing only on age bands where AZ provides positive health value (>50 years of age).
+
+additional_AZ_df <- vaccine_mix_ra %>%
+  # Keep only age groups where AZ has positive benefit
+  filter(a_name %in% c("80+", "70-79", "60-69", "50-59")) %>%
+  
+  # Collapse across vaccines (sum Pfizer/BioNTech + AZ)
+  group_by(r_name, a_name) %>%
+  summarise(
+    pop = first(pop),
+    admin_total = sum(admin),
+    unvaccinated = pop - admin_total,
+    .groups = "drop"
+  ) %>%
+  
+  # Compute proportion BEFORE formatting
+  mutate(
+    prop_unvaccinated = unvaccinated / pop
+  ) %>%
+  
+  # Apply clean non-scientific formatting
+  mutate(
+    pop = format(round(pop, 0), scientific = FALSE, big.mark = ","),
+    admin_total = format(round(admin_total, 2), scientific = FALSE, big.mark = ","),
+    unvaccinated = format(round(unvaccinated, 2), scientific = FALSE, big.mark = ","),
+    prop_unvaccinated = scales::percent(prop_unvaccinated, accuracy = 0.1)
+  ) %>%
+  
+  arrange(r_name, factor(a_name, levels = c("80+", "70-79", "60-69", "50-59")))
+
+# View table in RStudio Viewer
+View(additional_AZ_df)
+
+rank_AZ_targets <- additional_AZ_df %>%
+  # Only ages where AZ provides positive benefit
+  filter(a_name %in% c("80+", "70-79", "60-69", "50-59")) %>%
+  
+  # Convert back to numeric if previously formatted
+  mutate(
+    pop = as.numeric(gsub(",", "", pop)),
+    admin_total = as.numeric(gsub(",", "", admin_total)),
+    unvaccinated = as.numeric(gsub(",", "", unvaccinated))
+  ) %>%
+  
+  # Age ranking (higher = older)
+  mutate(
+    age_priority = case_when(
+      a_name == "80+"   ~ 4,
+      a_name == "70-79" ~ 3,
+      a_name == "60-69" ~ 2,
+      a_name == "50-59" ~ 1
+    ),
+    prop_unvaccinated = unvaccinated / pop
+  ) %>%
+  
+  # Sort by: 1) age priority, 2) proportion unvaccinated
+  arrange(desc(age_priority), desc(prop_unvaccinated)) %>%
+  
+  # Optional: make age priority human-readable (but not needed)
+  select(r_name, a_name, pop, admin_total, unvaccinated, prop_unvaccinated)
+
+View(rank_AZ_targets)
+
+# Sum unvaccinated for NORTH EAST, ages 80+ and 70–79
+NE_extra_AZ <- rank_AZ_targets %>%
+  filter(r_name == "NORTH EAST",
+         a_name %in% c("80+", "70-79")) %>%
+  summarise(extra_AZ_needed = sum(unvaccinated)) %>%
+  pull(extra_AZ_needed)
+
+# Round to whole doses
+NE_extra_AZ_round <- round(NE_extra_AZ)
+
+# Extract unused AstraZeneca supply
+unused_AZ_before <- supply_use %>%
+  filter(v_name == "AstraZeneca") %>%
+  pull(unallocated)
+
+# Compute leftover AZ after allocating to NE 80+ and 70–79
+unused_AZ_after <- unused_AZ_before - NE_extra_AZ_round
+
+cat(
+  sprintf(
+    "We would allocate an additional %s doses of AstraZeneca to North East (ages 80+ and 70–79), leaving %s unused AZ doses remaining.",
+    format(NE_extra_AZ_round, big.mark = ","),
+    format(round(unused_AZ_after), big.mark = ",")
+  ),
+  "\n"
+)
+
+# Beyond vaccinating 80+ and 70–79, the marginal benefit of additional AstraZeneca doses becomes extremely small (benefit 2 for 60-69 and 1 for 50–59 and 0 for <50). Because regional boxing capacity remains the binding constraint, allocating AZ to younger groups would crowd out the higher benefit achieved by Pfizer/BioNTech. Therefore, we recommend that any remaining AstraZeneca stock (~1.4 million doses) be diverted to international donation via COVAX rather than allocated domestically. For the remaining domestic campaign, Pfizer/BioNTech should be used exclusively.
+```
+
+
+```{r}
+# 9. Throughput & time-to-completion of Phase-1 -------------------------------
+# Using NHS site data (May 2021) scaled to 80% to approximate January capacity, we map sites into our 9 regions, apply per-site throughput, and compute each region’s daily vaccination capacity. We then estimate Phase-1 completion time under two assumptions: 
+# (i) vaccination starts only once all sites are supplied, and (ii) sites vaccinate immediately as they come online (5/day/region). Regional and national progress after 40 working days is compared across both.
+
+# 9.1 NHS vaccination sites by 7 super-regions (May 2021 data) 
+sites_7_may <- tibble::tribble(
+  ~region7,                  ~hospital, ~gp_led, ~mass, ~pharmacy, ~sites_total,
+  "East of England",               31,      134,    50,       40,          255,
+  "London",                        51,      103,    35,      109,          298,
+  "Midlands",                      40,      189,    20,       96,          345,
+  "North East and Yorkshire",      46,      173,    17,       96,          332,
+  "North West",                    49,      137,    11,       63,          260,
+  "South East",                    39,      180,    18,       66,          303,
+  "South West",                    21,      111,    13,       54,          199
+)
+
+cat("\n[9.0] May 2021 site counts (7 super-regions):\n")
+print(sites_7_may)
+
+# Approximate January availability = 80% of May sites
+sites_7_jan <- sites_7_may %>%
+  mutate(
+    hospital = round(hospital * 0.8),
+    gp_led   = round(gp_led   * 0.8),
+    mass     = round(mass     * 0.8),
+    pharmacy = round(pharmacy * 0.8),
+    sites_total = hospital + gp_led + mass + pharmacy
+  )
+
+cat("\n[9.0] Approx. January site availability (80% of May):\n")
+print(sites_7_jan)
+
+# 9.2 Population shares used to split Midlands and NE+Yorkshire into 4 regions
+pop_9 <- rowSums(P_ra)
+pop_9_tbl <- tibble::tibble(r_name = names(pop_9), pop = as.numeric(pop_9))
+
+midlands_regs <- c("EAST MIDLANDS", "WEST MIDLANDS")
+ne_york_regs  <- c("NORTH EAST", "YORKSHIRE AND THE HUMBER")
+
+midlands_share <- pop_9[midlands_regs] / sum(pop_9[midlands_regs])
+ne_york_share  <- pop_9[ne_york_regs]  / sum(pop_9[ne_york_regs])
+
+# 9.3 Build 9-region site table (Jan availability) and daily capacity
+sites_9 <- tibble::tibble(
+  r_name   = regions,
+  hospital = 0L, gp_led = 0L, mass = 0L, pharmacy = 0L
+)
+
+assign_sites <- function(rname, vals_vec) {
+  sites_9[sites_9$r_name == rname, c("hospital","gp_led","mass","pharmacy")] <<-
+    as.list(vals_vec)
+}
+
+# Direct mappings
+assign_sites("EAST",       as.numeric(sites_7_jan[1, c("hospital","gp_led","mass","pharmacy")]))
+assign_sites("LONDON",     as.numeric(sites_7_jan[2, c("hospital","gp_led","mass","pharmacy")]))
+assign_sites("NORTH WEST", as.numeric(sites_7_jan[5, c("hospital","gp_led","mass","pharmacy")]))
+assign_sites("SOUTH EAST", as.numeric(sites_7_jan[6, c("hospital","gp_led","mass","pharmacy")]))
+assign_sites("SOUTH WEST", as.numeric(sites_7_jan[7, c("hospital","gp_led","mass","pharmacy")]))
+
+
+# Splits: Midlands and North East & Yorkshire
+mid_row <- sites_7_jan[3, c("hospital","gp_led","mass","pharmacy")]
+for (mode in names(mid_row)) {
+  split_vals <- round(as.numeric(mid_row[[mode]]) * midlands_share)
+  sites_9[match(midlands_regs, sites_9$r_name), mode] <- split_vals
+}
+
+ney_row <- sites_7_jan[4, c("hospital","gp_led","mass","pharmacy")]
+for (mode in names(ney_row)) {
+  split_vals <- round(as.numeric(ney_row[[mode]]) * ne_york_share)
+  sites_9[match(ne_york_regs, sites_9$r_name), mode] <- split_vals
+}
+
+# Per-site throughput assumptions
+site_cap <- c(hospital = 800, gp_led = 400, mass = 3000, pharmacy = 250)
+
+sites_9 <- sites_9 %>%
+  mutate(
+    total_sites = hospital + gp_led + mass + pharmacy,
+    daily_capacity =
+      hospital * site_cap["hospital"] +
+      gp_led   * site_cap["gp_led"]   +
+      mass     * site_cap["mass"]     +
+      pharmacy * site_cap["pharmacy"]
+  )
+
+cat("\n[9.1] Estimated Jan-2021 sites and daily capacity by region:\n")
+print(sites_9)
+
+# 9.5 Join with allocations and compute completion times
+throughput_df <- region_vaccine_doses %>%
+  # keep total + split by vaccine
+  select(r_name,
+         total_region,
+         pfizer_doses = `Pfizer/BioNTech`,
+         az_doses     = `AstraZeneca`) %>%
+  left_join(sites_9, by = "r_name") %>%
+  mutate(
+    # If a region has no doses at all, avoid division-by-zero
+    total_region = ifelse(is.na(total_region), 0, total_region),
+    
+    # Shares of regional workload by vaccine
+    share_pfizer = ifelse(total_region > 0, pfizer_doses / total_region, 0),
+    share_az     = ifelse(total_region > 0, az_doses     / total_region, 0),
+    
+    # Split sites into Pfizer-only vs AZ-only (approximate, can be fractional)
+    sites_pfizer = total_sites * share_pfizer,
+    sites_az     = total_sites * share_az,
+    
+    # Because daily_capacity is linear in site counts, we can scale it
+    daily_cap_pfizer = ifelse(total_sites > 0,
+                              daily_capacity * share_pfizer,
+                              0),
+    daily_cap_az     = ifelse(total_sites > 0,
+                              daily_capacity * share_az,
+                              0),
+    
+    # Days needed per vaccine type (respecting that sites are exclusive)
+    vacc_days_pfizer = ifelse(daily_cap_pfizer > 0,
+                              pfizer_doses / daily_cap_pfizer,
+                              0),
+    vacc_days_az     = ifelse(daily_cap_az > 0,
+                              az_doses / daily_cap_az,
+                              0),
+    
+    # Vaccination duration is driven by the slower of the two
+    vacc_days = pmax(vacc_days_pfizer, vacc_days_az),
+    
+    # Delivery days unchanged: still limited by 5 new sites per day
+    delivery_days  = ceiling(total_sites / 5),
+    
+    total_days     = pmax(vacc_days, delivery_days),
+    weeks_calendar = total_days / 7,
+    weeks_working  = total_days / 5
+  ) %>%
+  arrange(desc(total_days))
+
+cat("\n[9.2] Days/weeks to complete Phase-1 by region:\n")
+print(throughput_df)
+View(throughput_df)
+
+# 9.6 Conservative progress after 40 working days
+days_horizon <- 40
+
+progress_40 <- throughput_df %>%
+  mutate(
+    # Only vaccinate once all sites are online
+    days_active_40 = pmax(0, days_horizon - delivery_days),
+    
+    # Respect 1 vaccine type per site: use split capacities
+    vaccinated_pfizer_40 = pmin(pfizer_doses,
+                                daily_cap_pfizer * days_active_40),
+    vaccinated_az_40      = pmin(az_doses,
+                                 daily_cap_az * days_active_40),
+    
+    vaccinated_40 = vaccinated_pfizer_40 + vaccinated_az_40,
+    prop_done_40  = ifelse(total_region > 0,
+                           vaccinated_40 / total_region,
+                           NA_real_)
+  ) %>%
+  arrange(desc(prop_done_40))
+
+# National totals (conservative)
+vaccinated_40   <- sum(progress_40$vaccinated_40)
+total_phase1    <- sum(progress_40$total_region)
+prop_phase1_40  <- vaccinated_40 / total_phase1
+
+cat("\n[9.3] Conservative scenario (no vaccination before full supply):\n")
+cat("  - Vaccinated nationally:", format(round(vaccinated_40), big.mark=","), "\n")
+cat("  - Share of Phase-1 completed:",
+    sprintf("%.1f%%", 100 * prop_phase1_40), "\n\n")
+
+cat("[9.3] Regional conservative progress:\n")
+print(progress_40)
+View(progress_40)
+
+# 9.7 Ramp-up scenario: vaccinate as soon as sites come online
+days_seq <- 1:days_horizon
+
+progress_40_ramp <- throughput_df %>%
+  # keep everything we need, including vaccine shares and doses
+  select(r_name,
+         total_region,
+         total_sites,
+         daily_capacity,
+         share_pfizer,
+         share_az,
+         pfizer_doses,
+         az_doses) %>%
+  mutate(
+    avg_cap_per_site = if_else(total_sites > 0,
+                               daily_capacity / total_sites, 0)
+  ) %>%
+  rowwise() %>%
+  mutate(
+    # Cumulative pooled capacity as sites ramp up (5 new sites/day max)
+    cum_capacity_40 = sum(pmin(total_sites, 5 * days_seq) * avg_cap_per_site),
+    
+    # Split cumulative capacity between Pfizer-only and AZ-only sites
+    cum_capacity_pfizer_40 = cum_capacity_40 * share_pfizer,
+    cum_capacity_az_40     = cum_capacity_40 * share_az,
+    
+    # Vaccinated doses per vaccine type (respecting 1 vaccine/site)
+    vaccinated_pfizer_40_ramp = min(pfizer_doses, cum_capacity_pfizer_40),
+    vaccinated_az_40_ramp     = min(az_doses,   cum_capacity_az_40),
+    
+    vaccinated_40_ramp = vaccinated_pfizer_40_ramp + vaccinated_az_40_ramp,
+    prop_done_40_ramp  = ifelse(total_region > 0,
+                                vaccinated_40_ramp / total_region,
+                                NA_real_)
+  ) %>%
+  ungroup() %>%
+  arrange(desc(prop_done_40_ramp))
+
+# National totals (ramp-up)
+vaccinated_40_ramp_nat  <- sum(progress_40_ramp$vaccinated_40_ramp)
+total_phase1_nat        <- sum(progress_40_ramp$total_region)
+prop_phase1_40_ramp_nat <- vaccinated_40_ramp_nat / total_phase1_nat
+
+cat("\n[9.4] Ramp-up scenario (vaccinate as sites come online):\n")
+cat("  - Vaccinated nationally:", format(round(vaccinated_40_ramp_nat), big.mark=","), "\n")
+cat("  - Share of Phase-1 completed:",
+    sprintf("%.1f%%", 100 * prop_phase1_40_ramp_nat), "\n\n")
+
+comparison_40 <- progress_40 %>%
+  select(r_name, total_region, daily_capacity, delivery_days,
+         prop_done_40_conservative = prop_done_40) %>%
+  left_join(
+    progress_40_ramp %>% select(r_name, vaccinated_40_ramp, prop_done_40_ramp),
+    by = "r_name"
+  ) %>%
+  arrange(desc(prop_done_40_ramp))
+
+cat("[9.4] Comparison: ramp-up vs conservative:\n")
+print(comparison_40)
+View(comparison_40)
+
+# Our throughput analysis shows that regional vaccination speed is shaped jointly by site availability and logistical delivery constraints. 
+# Under the conservative scenario, where regions begin vaccinating only once all sites are fully supplied, progress after 40 working days remains modest, with several regions completing less than half of their Phase-1 allocation. 
+# In contrast, the ramp-up scenario, where sites vaccinate as soon as they come online at a rate of five sites per region per day, delivers substantially faster progress: most regions complete a significantly greater share of their allocation within the same 40-day window, and national completion rises markedly. The gap between these scenarios highlights that delivery sequencing, rather than sheer site numbers, is the primary driver of Phase-1 speed. 
+# Strategically, this suggests that early activation of vaccination sites—paired with reliable daily supply—offers the most effective route to accelerating Phase-1 completion without requiring additional infrastructure.
+```
+
+```{r}
+# 10. Baseline model: population-proportional allocation ----------------------
+# Goal: build a simple, defendable baseline to compare against the optimised model.
+# Logic:
+#  1) Allocate vaccine supply proportional to regional age-population.
+#  2) Enforce AZ not used under 50.
+#  3) Enforce population caps and boxing capacity via proportional scaling.
+
+# As a benchmark, we construct a simple population-proportional baseline model in which vaccines are allocated to each region and age group purely according to their share of the national population. This approach ignores benefit scores and frontline priorities, reflecting what a “fair but unsophisticated” planner might do. After generating these proportional allocations, we enforce feasibility by capping doses at each region–age population level and scaling allocations down if regional boxing capacities are exceeded. The result is a defendable but naive comparator that respects the same constraints as our optimisation model, allowing us to quantify how much value the optimised solution adds.
+
+
+# 10.1 Build base grid with population and vaccine info
+
+baseline_grid <- expand_grid(
+  v_name = vaccines,
+  r_name = regions,
+  a_name = age_groups
+) %>%
+  # attach population per (region, age)
+  mutate(
+    pop = as.numeric(P_ra[
+      cbind(match(r_name, regions), match(a_name, age_groups))
+    ])
+  )
+
+# Apply simple AZ age rule in the baseline as well: AZ only 50+
+baseline_grid <- baseline_grid %>%
+  mutate(
+    allowed = case_when(
+      v_name == "AstraZeneca" & a_name %in% c("30-49", "<30") ~ FALSE,
+      TRUE ~ TRUE
+    )
+  )
+
+# 10.2 Population-proportional allocation before caps 
+baseline_raw <- baseline_grid %>%
+  group_by(v_name) %>%
+  mutate(
+    total_pop_allowed_v = sum(pop[allowed], na.rm = TRUE),
+    share = ifelse(allowed & total_pop_allowed_v > 0,
+                   pop / total_pop_allowed_v, 0),
+    alloc_raw = S_total[v_name] * share
+  ) %>%
+  ungroup()
+
+# 10.3 Enforce population caps per (region, age) 
+
+baseline_pop_capped <- baseline_raw %>%
+  group_by(r_name, a_name) %>%
+  mutate(
+    alloc_cell_total = sum(alloc_raw),
+    cap_factor = ifelse(alloc_cell_total > 0,
+                        pmin(1, pop / alloc_cell_total),
+                        1),
+    alloc_pop_capped = alloc_raw * cap_factor
+  ) %>%
+  ungroup()
+
+# 10.4 Enforce boxing capacity per region via proportional scaling 
+
+baseline_box_capped <- baseline_pop_capped %>%
+  mutate(units = u[v_name] * alloc_pop_capped) %>%
+  group_by(r_name) %>%
+  mutate(
+    units_region = sum(units),
+    K_region     = K_r[r_name],
+    box_factor   = ifelse(units_region > 0,
+                          pmin(1, K_region / units_region),
+                          1),
+    alloc_final  = alloc_pop_capped * box_factor
+  ) %>%
+  ungroup()
+
+# Final baseline allocation table (same structure as sol_x)
+baseline_x <- baseline_box_capped %>%
+  select(v_name, r_name, a_name, value = alloc_final)
+
+cat("\n[10.1] Baseline population-proportional allocation built.\n")
+print(head(baseline_x))
+
+# 10.5 Compare baseline vs optimised: benefit, supply use, frontline
+
+# Helper: benefit lookup
+benefit_lookup <- function(v, a) b_va[v, a]
+
+# Optimised benefit
+opt_benefit <- sol_x %>%
+  mutate(b = mapply(benefit_lookup, v_name, a_name)) %>%
+  summarise(total_benefit = sum(b * value)) %>%
+  pull(total_benefit)
+
+# Baseline benefit
+base_benefit <- baseline_x %>%
+  mutate(b = mapply(benefit_lookup, v_name, a_name)) %>%
+  summarise(total_benefit = sum(b * value)) %>%
+  pull(total_benefit)
+
+benefit_comp <- tibble::tibble(
+  scenario      = c("Optimised", "Baseline"),
+  total_benefit = c(opt_benefit, base_benefit)
+) %>%
+  mutate(
+    rel_to_base = total_benefit / total_benefit[scenario == "Baseline"]
+  )
+
+cat("\n[10.2] Total benefit: optimised vs baseline:\n")
+print(benefit_comp)
+
+# 10.6 Frontline coverage comparison
+
+# Function to look up FL_min_ra by (region, age)
+FL_lookup <- function(r, a) FL_min_ra[
+  cbind(match(r, rownames(FL_min_ra)),
+        match(a, colnames(FL_min_ra)))
+]
+
+# Optimised frontline gap
+fl_opt <- sol_x %>%
+  group_by(r_name, a_name) %>%
+  summarise(admin = sum(value), .groups = "drop") %>%
+  mutate(
+    need = mapply(FL_lookup, r_name, a_name),
+    gap  = pmax(0, need - admin)
+  )
+
+# Baseline frontline gap
+fl_base <- baseline_x %>%
+  group_by(r_name, a_name) %>%
+  summarise(admin = sum(value), .groups = "drop") %>%
+  mutate(
+    need = mapply(FL_lookup, r_name, a_name),
+    gap  = pmax(0, need - admin)
+  )
+
+fl_summary <- tibble::tibble(
+  scenario          = c("Optimised", "Baseline"),
+  total_FL_need     = c(sum(fl_opt$need), sum(fl_base$need)),
+  total_FL_gap      = c(sum(fl_opt$gap),  sum(fl_base$gap)),
+  FL_coverage_ratio = 1 - total_FL_gap / total_FL_need
+)
+
+cat("\n[10.3] Frontline coverage: optimised vs baseline:\n")
+print(fl_summary)
+
+# 10.7 Regional comparison (optional, but good for plots)
+
+regional_comp <- sol_x %>%
+  group_by(r_name) %>%
+  summarise(opt_doses = sum(value), .groups = "drop") %>%
+  full_join(
+    baseline_x %>%
+      group_by(r_name) %>%
+      summarise(base_doses = sum(value), .groups = "drop"),
+    by = "r_name"
+  ) %>%
+  replace_na(list(opt_doses = 0, base_doses = 0)) %>%
+  mutate(diff_opt_minus_base = opt_doses - base_doses)
+
+cat("\n[10.4] Regional doses: optimised vs baseline (difference = opt - base):\n")
+print(regional_comp)
+
+# The population-proportional baseline provides a simple, intuitive reference point, but performs substantially worse than our optimised model. Total health benefit under the baseline reaches only 45.9 million units, whereas the optimised model achieves 83.3 million—an improvement of approximately 81%. The baseline also fails to protect all frontline workers, leaving 11,638 individuals uncovered, while our optimised allocation satisfies frontline minima exactly.
+
+# Regionally, the baseline distributes doses strictly according to population, but this ignores the heterogeneity in clinical benefit and logistics constraints. The optimised model reallocates doses toward high-value regions such as the North East and South East, and away from lower-impact regions like London, resulting in a far more effective and policy-aligned rollout. 
+
+# Overall, these comparisons show that our optimisation framework delivers a dramatically superior and more defensible allocation than any simple proportional rule.
+```
+
+
+
+
+
