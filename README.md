@@ -60,8 +60,10 @@ code/
     vaccine_optimisation.Rmd               # LP model definition, constraints, and optimisation logic
 
 results/
-    optimal_phase1_allocation_ordered.csv  # Model output: ordered vaccine allocation by region & age group
+    optimal_phase1_allocation_results.csv  # Model output: ordered vaccine allocation by region & age group
 
 presentation/
-    Phase1_Proposal.pdf                    # Formal proposal prepared for the simulated UK Vaccine Taskforce
-    Pitch_Slides.pdf                       # Presentation deck for client briefing
+    vaccine_optimisation_tender            # Formal project tender for vaccine allocation
+    vaccine_optimisation_proposal.pdf      # Formal proposal prepared for the simulated UK Vaccine Taskforce
+    vaccine_optimisation_presentation.pdf  # Presentation deck for client briefing
+    
